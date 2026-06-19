@@ -1,7 +1,7 @@
 use bevellm::{
     LLMAgent, LLMAgentWorld, LlmModel, LlmRequest, LlmResponse, LlmResponseMode, LlmRuntimeConfig,
-    LlmRuntimePlugin, LlmRuntimeProfileConfig, LlmTaskRoutingConfig, install_llm_world_sync,
-    llm_world_context,
+    LlmRuntimePlugin, LlmRuntimeProfileConfig, LlmTaskRoutingConfig, LlmToolCallingMode,
+    install_llm_world_sync, llm_world_context,
 };
 use bevy_app::{App, Startup, Update};
 use bevy_ecs::prelude::*;
@@ -254,6 +254,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 id: String::from("qwen"),
                 model: LlmModel::Qwen2_5_1_5BInstructQ4KM,
                 use_gpu: true,
+                tool_calling: LlmToolCallingMode::Auto,
                 worker_count: 1,
                 temperature: None,
                 top_p: None,

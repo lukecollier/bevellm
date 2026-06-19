@@ -96,6 +96,9 @@ pub fn build_playback_queue(conversation: &GeneratedConversation) -> VecDeque<Sc
     let mut starts_after = Duration::ZERO;
     let mut queue = VecDeque::with_capacity(conversation.utterances.len());
     for utterance in &conversation.utterances {
+        if utterance.text.trim().is_empty() {
+            continue;
+        }
         let duration = estimate_utterance_duration(&utterance.text);
         queue.push_back(ScheduledUtterance {
             speaker: utterance.speaker.clone(),
@@ -199,10 +202,27 @@ fn start_generated_conversation(
     playback.participants = conversation.participants.clone();
     playback.started_at = Some(Instant::now());
     playback.queue = build_playback_queue(conversation);
-    playback.pending_fact_store_requests = conversation.utterances.len();
-    playback.pending_fact_extraction_requests = conversation.utterances.len();
+    playback.pending_fact_store_requests = playback.queue.len();
+    playback.pending_fact_extraction_requests = playback.queue.len();
 
     for (utterance_index, utterance) in conversation.utterances.iter().cloned().enumerate() {
+        if utterance.text.trim().is_empty() {
+            if !utterance.tool_calls.is_empty() {
+                info!(
+                    "[session] action utterance -> session={} speaker={} tool_calls={}",
+                    conversation.session_id,
+                    utterance.speaker,
+                    utterance
+                        .tool_calls
+                        .iter()
+                        .map(|call| call.tool.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            continue;
+        }
+
         fact_extraction_commands.send(LlmFactExtractionCommand::ExtractFactFromUtterance {
             request_id: format!("{}:extract:{utterance_index}", conversation.session_id),
             session_id: conversation.session_id.clone(),
@@ -323,14 +343,24 @@ fn play_generated_conversation(
             .queue
             .pop_front()
             .expect("queue front should exist");
-        info!(
-            "[session] utterance -> session={} speaker={} start={:?} duration={:?} text={}",
-            playback.session_id.as_deref().unwrap_or("<unknown>"),
-            utterance.speaker,
-            utterance.starts_after,
-            utterance.duration,
-            utterance.text
-        );
+        if utterance.text.is_empty() {
+            info!(
+                "[session] utterance -> session={} speaker={} start={:?} duration={:?} text=<empty>",
+                playback.session_id.as_deref().unwrap_or("<unknown>"),
+                utterance.speaker,
+                utterance.starts_after,
+                utterance.duration
+            );
+        } else {
+            info!(
+                "[session] utterance -> session={} speaker={} start={:?} duration={:?} text={}",
+                playback.session_id.as_deref().unwrap_or("<unknown>"),
+                utterance.speaker,
+                utterance.starts_after,
+                utterance.duration,
+                utterance.text
+            );
+        }
     }
 
     update_completion_state(&mut transcript, &mut playback);
@@ -348,9 +378,9 @@ impl ParticipantFactLedger {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_playback_queue, estimate_utterance_duration, format_fact_store_prompt,
         ConversationPlaybackState, ConversationTranscriptPhase, ConversationTranscriptState,
-        ParticipantFactLedger,
+        ParticipantFactLedger, build_playback_queue, estimate_utterance_duration,
+        format_fact_store_prompt,
     };
     use crate::{
         GeneratedConversation, LlmConversationFact, LlmConversationGenerationEvent,
@@ -402,10 +432,12 @@ mod tests {
                 PlannedUtterance {
                     speaker: String::from("alpha"),
                     text: String::from("Hold the bridge."),
+                    tool_calls: Vec::new(),
                 },
                 PlannedUtterance {
                     speaker: String::from("bravo"),
                     text: String::from("I see movement on the east path."),
+                    tool_calls: Vec::new(),
                 },
             ],
         };
@@ -417,10 +449,38 @@ mod tests {
     }
 
     #[test]
+    fn playback_queue_skips_action_only_utterances() {
+        let conversation = GeneratedConversation {
+            session_id: String::from("session-1"),
+            participants: vec![String::from("alpha")],
+            utterances: vec![
+                PlannedUtterance {
+                    speaker: String::from("alpha"),
+                    text: String::from(""),
+                    tool_calls: vec![crate::LlmToolCall {
+                        tool: String::from("advance_to_bridge"),
+                        arguments: serde_json::json!({"direction":"east"}),
+                    }],
+                },
+                PlannedUtterance {
+                    speaker: String::from("alpha"),
+                    text: String::from("Hold here."),
+                    tool_calls: Vec::new(),
+                },
+            ],
+        };
+
+        let queue = build_playback_queue(&conversation);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.front().unwrap().text, "Hold here.");
+    }
+
+    #[test]
     fn fact_store_prompt_uses_exact_utterance_text() {
         let utterance = PlannedUtterance {
             speaker: String::from("alpha"),
             text: String::from("Hold the bridge."),
+            tool_calls: Vec::new(),
         };
 
         assert_eq!(
@@ -490,6 +550,7 @@ mod tests {
                     utterances: vec![PlannedUtterance {
                         speaker: String::from("alpha"),
                         text: String::from("Hold the bridge."),
+                        tool_calls: Vec::new(),
                     }],
                 },
             });
@@ -545,6 +606,7 @@ mod tests {
                     utterances: vec![PlannedUtterance {
                         speaker: String::from("alpha"),
                         text: String::from("Hold the bridge."),
+                        tool_calls: Vec::new(),
                     }],
                 },
             });

@@ -12,10 +12,8 @@ pub use llm::{
 
 use bevy_app::{App, Plugin, PreUpdate, Update};
 use bevy_ecs::prelude::*;
-use candle_core::Device;
 use crossbeam_channel as crossbeam;
 use log::{debug, info};
-use rig_core::completion::ToolDefinition;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +32,55 @@ pub enum LlmResponseMode {
     StructuredJson,
     /// Plain text for local world-facing speech.
     PlainTextChat,
+}
+
+/// Model-specific tool calling behavior for a runtime profile.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum LlmToolCallingMode {
+    /// Do not expose tools to the model.
+    #[default]
+    Disabled,
+    /// Use the model's recommended tool-calling format.
+    Auto,
+    /// Expose tools and let the model choose when to use them.
+    Native,
+    /// Expose tools using the agentic XML style used by SmolLM3.
+    AgenticXml,
+    /// Expose tools using a python-style call format.
+    Python,
+}
+
+impl LlmToolCallingMode {
+    pub fn resolve_for_model(self, model: LlmModel) -> Self {
+        match self {
+            Self::Auto => match model {
+                LlmModel::SmolLM3_3BQ4KM => Self::AgenticXml,
+                LlmModel::SmolLM2_360MInstruct
+                | LlmModel::SmolLM2_1_7BInstructQ4KM
+                | LlmModel::Qwen2_5_1_5BInstructQ2K
+                | LlmModel::Qwen2_5_1_5BInstructQ4KM => Self::Native,
+            },
+            other => other,
+        }
+    }
+}
+
+/// A tool definition exposed to an LLM request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+impl LlmToolDefinition {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
 }
 
 /// A request from the game to an LLM agent.
@@ -57,7 +104,7 @@ pub struct LlmRequest {
     pub response_mode: LlmResponseMode,
     /// Tool definitions exposed to the model for this request.
     #[serde(default)]
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<LlmToolDefinition>,
 }
 
 /// Conversation lifecycle commands for named LLM threads.
@@ -93,14 +140,16 @@ pub enum LlmConversationGenerationCommand {
 }
 
 /// Planned conversation utterance for Bevy-side playback.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlannedUtterance {
     pub speaker: String,
     pub text: String,
+    #[serde(default)]
+    pub tool_calls: Vec<LlmToolCall>,
 }
 
 /// Full generated conversation transcript for Bevy-side playback.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GeneratedConversation {
     pub session_id: String,
     pub participants: Vec<String>,
@@ -108,7 +157,7 @@ pub struct GeneratedConversation {
 }
 
 /// One-shot conversation generation events emitted by the runtime.
-#[derive(Debug, Clone, Event, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Event, Serialize, Deserialize, PartialEq)]
 pub enum LlmConversationGenerationEvent {
     ConversationGenerated { conversation: GeneratedConversation },
     ConversationGenerationFailed { session_id: String, reason: String },
@@ -182,6 +231,27 @@ pub struct LlmResponse {
     /// All tool calls captured from the model output.
     #[serde(default)]
     pub tool_calls: Vec<LlmToolCall>,
+}
+
+/// Lightweight summary of the tools exposed to a model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmToolSet {
+    names: Vec<String>,
+    definitions: Vec<LlmToolDefinition>,
+}
+
+impl LlmToolSet {
+    pub fn new(names: Vec<String>, definitions: Vec<LlmToolDefinition>) -> Self {
+        Self { names, definitions }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.names.iter().any(|candidate| candidate == name)
+    }
+
+    pub fn definitions(&self) -> &[LlmToolDefinition] {
+        &self.definitions
+    }
 }
 
 /// Marks an ECS entity as an LLM-backed agent.
@@ -265,6 +335,7 @@ struct ConversationGenerationRequest {
     initial_message: String,
     facts: Vec<String>,
     participant_profiles: Vec<ConversationParticipantProfile>,
+    tool_calling: LlmToolCallingMode,
 }
 
 #[derive(Debug, Clone)]
@@ -305,7 +376,7 @@ struct TurnGenerationTask {
     prompt: String,
     response_mode: LlmResponseMode,
     facts: Vec<LlmConversationFact>,
-    tools: Vec<ToolDefinition>,
+    tools: Vec<LlmToolDefinition>,
     world: Option<LlmWorldContext>,
     conversation: Option<LlmConversationState>,
     session_participants: Option<Vec<String>>,
@@ -385,11 +456,11 @@ trait RuntimeExecutor: Send {
     ) -> Result<Vec<LlmConversationFact>, llm::LlmRuntimeError>;
 }
 
-struct CandleRuntimeExecutor {
+struct MistralRuntimeExecutor {
     runtime: LlmRuntime,
 }
 
-impl RuntimeExecutor for CandleRuntimeExecutor {
+impl RuntimeExecutor for MistralRuntimeExecutor {
     fn refresh_conversation_facts(
         &mut self,
         conversation: &mut LlmConversationState,
@@ -443,7 +514,7 @@ pub enum LLMActionError {
     Dispatch(String),
 }
 
-/// In-process inbox for actions emitted by Rig tools.
+/// In-process inbox for actions emitted by model tool calls.
 ///
 /// The tools send actions from whatever thread they run on. A Bevy system
 /// drains this inbox and converts the actions into Bevy events.
@@ -591,6 +662,7 @@ pub struct LlmRuntimeBridge {
     active_cancellations: Arc<Mutex<HashMap<ConversationKey, Arc<AtomicBool>>>>,
     generated_conversations: Arc<Mutex<HashMap<String, ConversationGenerationState>>>,
     generated_conversation_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    turn_generation_tool_calling: LlmToolCallingMode,
 }
 
 impl LlmRuntimeBridge {
@@ -604,6 +676,7 @@ impl LlmRuntimeBridge {
         active_cancellations: Arc<Mutex<HashMap<ConversationKey, Arc<AtomicBool>>>>,
         generated_conversations: Arc<Mutex<HashMap<String, ConversationGenerationState>>>,
         generated_conversation_cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+        turn_generation_tool_calling: LlmToolCallingMode,
     ) -> Self {
         Self {
             request_tx,
@@ -615,6 +688,7 @@ impl LlmRuntimeBridge {
             active_cancellations,
             generated_conversations,
             generated_conversation_cancellations,
+            turn_generation_tool_calling,
         }
     }
 
@@ -883,6 +957,7 @@ impl LlmRuntimeBridge {
                 initial_message,
                 facts,
                 participant_profiles,
+                tool_calling: self.turn_generation_tool_calling,
             }
         };
 
@@ -1539,12 +1614,19 @@ Return exactly one JSON object.\n\
 No extra text.\n\
 The JSON object must contain only one field: `utterances`.\n\
 `utterances` must be an array of objects.\n\
-Each utterance object must contain only `speaker` and `text` string fields.\n\
+Each utterance object must contain a `speaker` string field and a `text` string field.\n\
+It may also contain a `tool_calls` array for proposed actions.\n\
 Each `speaker` must exactly match one of the provided participant ids.\n\
-Each `text` must be message content only, with no speaker prefix.\n\
+Each `text` must be spoken dialogue only, with no speaker prefix.\n\
+If an utterance combines spoken dialogue and an action, keep the dialogue in `text` and put the action in `tool_calls`.\n\
+Only leave `text` empty when the utterance is purely an action beat with no spoken line.\n\
 Do not include markdown.\n\
 Do not include narration or stage directions.\n",
     );
+    content.push_str(&format!(
+        "Active tool-calling format for proposed actions: {}.\n",
+        tool_calling_mode_display(request.tool_calling)
+    ));
     content.push_str(&format!(
         "Produce at most {} utterances.\n\n",
         GENERATED_CONVERSATION_MAX_UTTERANCES
@@ -1555,7 +1637,8 @@ Do not include narration or stage directions.\n",
 - Ground the dialogue in the initial situation.\n\
 - Let the participants' personas and current goals influence their wording and priorities.\n\
 - Prefer including every participant at least once when that fits within the utterance cap.\n\
-- Keep each line as spoken dialogue only.\n\n",
+- Keep each line as spoken dialogue when speech is present, and pair that dialogue with `tool_calls` when the speaker is also acting.\n\
+- Do not narrate actions in `text`; use `tool_calls` for proposed actions, but keep the speaker's line in `text` when there is one.\n\n",
     );
     content.push_str("Initial situation:\n");
     content.push_str(&request.initial_message);
@@ -1582,9 +1665,19 @@ Do not include narration or stage directions.\n",
         content.push_str(&format!("- {}\n", participant.id));
     }
     content.push_str(
-        "\nOutput example:\n{\"utterances\":[{\"speaker\":\"agent_alpha\",\"text\":\"Move to the bridge.\"}]}\n",
+        "\nOutput example:\n{\"utterances\":[{\"speaker\":\"agent_alpha\",\"text\":\"Move to the bridge, but stay low.\",\"tool_calls\":[{\"tool\":\"secure_bridge_approach\",\"arguments\":{\"approach\":\"east\"}}]},{\"speaker\":\"agent_bravo\",\"text\":\"I’m warning you, the eastern path is exposed.\",\"tool_calls\":[{\"tool\":\"warn_about_exposed_path\",\"arguments\":{\"path\":\"eastern\",\"severity\":\"high\"}}]}]}\n",
     );
     content
+}
+
+fn tool_calling_mode_display(mode: LlmToolCallingMode) -> &'static str {
+    match mode {
+        LlmToolCallingMode::Disabled => "disabled",
+        LlmToolCallingMode::Auto => "auto",
+        LlmToolCallingMode::Native => "native",
+        LlmToolCallingMode::AgenticXml => "agentic XML",
+        LlmToolCallingMode::Python => "python",
+    }
 }
 
 fn empty_to_placeholder(value: &str) -> &str {
@@ -1604,6 +1697,8 @@ struct GeneratedConversationJson {
 struct PlannedUtteranceJson {
     speaker: String,
     text: String,
+    #[serde(default)]
+    tool_calls: Vec<LlmToolCall>,
 }
 
 fn parse_generated_conversation_response(
@@ -1626,7 +1721,7 @@ fn parse_generated_conversation_response(
             return Err(format!("unknown speaker id `{}`", utterance.speaker));
         }
         let text = utterance.text.trim();
-        if text.is_empty() {
+        if text.is_empty() && utterance.tool_calls.is_empty() {
             return Err(format!(
                 "blank utterance from speaker `{}`",
                 utterance.speaker
@@ -1635,6 +1730,7 @@ fn parse_generated_conversation_response(
         utterances.push(PlannedUtterance {
             speaker: utterance.speaker,
             text: text.to_string(),
+            tool_calls: utterance.tool_calls,
         });
     }
     Ok(utterances)
@@ -1675,7 +1771,7 @@ pub fn spawn_llm_runtime_bridge(
             + Sync,
     > = Arc::new(|profile, worker_index| {
         let runtime = LlmRuntime::load(profile)?.with_worker_index(worker_index);
-        Ok(Box::new(CandleRuntimeExecutor { runtime }))
+        Ok(Box::new(MistralRuntimeExecutor { runtime }))
     });
     spawn_llm_runtime_bridge_with_factory(config, factory)
 }
@@ -1783,6 +1879,16 @@ fn spawn_llm_runtime_bridge_with_factory(
         }
     }
 
+    let turn_generation_tool_calling = validated
+        .profiles
+        .iter()
+        .find(|profile| profile.id == validated.routing.turn_generation_profile)
+        .map(|profile| profile.tool_calling.resolve_for_model(profile.model))
+        .ok_or_else(|| llm::LlmRuntimeError::MissingRoutedProfile {
+            route: "turn_generation_profile",
+            profile_id: validated.routing.turn_generation_profile.clone(),
+        })?;
+
     let routing = validated.routing.clone();
     let coordinator_turn_tx = turn_tx.clone();
     let coordinator_worlds = Arc::clone(&worlds);
@@ -1880,6 +1986,7 @@ fn spawn_llm_runtime_bridge_with_factory(
         active_cancellations,
         generated_conversations,
         generated_conversation_cancellations,
+        turn_generation_tool_calling,
     ))
 }
 
@@ -2167,10 +2274,12 @@ mod tests {
         BridgeOutput, FACT_STORE_CONVERSATION_ID, LlmConversationGenerationCommand,
         LlmConversationGenerationEvent, LlmFactExtractionCommand, LlmFactExtractionEvent,
         LlmFactStoreCommand, LlmFactStoreEvent, LlmRequest, LlmResponseMode, LlmRuntimeBridge,
-        LlmRuntimeProfileConfig, LlmTaskRoutingConfig, LlmWorldContext, PlannedUtterance,
-        RoutedTaskKind, RuntimeExecutor, TurnGenerationTask, build_generated_conversation_prompt,
-        llm, parse_generated_conversation_response, spawn_llm_runtime_bridge_with_factory,
+        LlmRuntimeProfileConfig, LlmTaskRoutingConfig, LlmToolCall, LlmToolCallingMode,
+        LlmWorldContext, PlannedUtterance, RoutedTaskKind, RuntimeExecutor, TurnGenerationTask,
+        build_generated_conversation_prompt, llm, parse_generated_conversation_response,
+        spawn_llm_runtime_bridge_with_factory,
     };
+    use crate::LlmModel;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -2333,10 +2442,12 @@ mod tests {
                 PlannedUtterance {
                     speaker: String::from("alpha"),
                     text: String::from("Hold the bridge."),
+                    tool_calls: Vec::new(),
                 },
                 PlannedUtterance {
                     speaker: String::from("bravo"),
                     text: String::from("I see movement."),
+                    tool_calls: Vec::new(),
                 },
             ]
         );
@@ -2455,11 +2566,48 @@ mod tests {
                     current_goal: String::from("Warn about the east path."),
                 },
             ],
+            tool_calling: LlmToolCallingMode::Native,
         });
 
         assert!(prompt.contains("Conversation facts gathered from prior rounds:"));
         assert!(prompt.contains("The eastern path is exposed."));
         assert!(prompt.contains("The bridge must be secured first."));
+        assert!(prompt.contains("Active tool-calling format for proposed actions: native."));
+        assert!(prompt.contains("keep the dialogue in `text` and put the action in `tool_calls`"));
+        assert!(
+            prompt.contains("Only leave `text` empty when the utterance is purely an action beat")
+        );
+        assert!(prompt.contains("tool_calls"));
+    }
+
+    #[test]
+    fn tool_calling_mode_auto_resolves_by_model() {
+        assert_eq!(
+            LlmToolCallingMode::Auto.resolve_for_model(LlmModel::Qwen2_5_1_5BInstructQ4KM),
+            LlmToolCallingMode::Native
+        );
+        assert_eq!(
+            LlmToolCallingMode::Auto.resolve_for_model(LlmModel::SmolLM3_3BQ4KM),
+            LlmToolCallingMode::AgenticXml
+        );
+    }
+
+    #[test]
+    fn generated_conversation_json_parses_tool_only_utterances() {
+        let utterances = parse_generated_conversation_response(
+            "{\"utterances\":[{\"speaker\":\"alpha\",\"text\":\"\",\"tool_calls\":[{\"tool\":\"advance_to_bridge\",\"arguments\":{\"direction\":\"east\"}}]}]}",
+            &[String::from("alpha")],
+            6,
+        )
+        .expect("conversation should parse");
+        assert!(utterances[0].text.is_empty());
+        assert_eq!(
+            utterances[0].tool_calls,
+            vec![LlmToolCall {
+                tool: String::from("advance_to_bridge"),
+                arguments: serde_json::json!({"direction":"east"}),
+            }]
+        );
     }
 
     #[test]
@@ -2529,6 +2677,7 @@ mod tests {
                 utterance: PlannedUtterance {
                     speaker: String::from("alpha"),
                     text: String::from("Supplies are in the shed."),
+                    tool_calls: Vec::new(),
                 },
             })
             .expect("fact extraction should dispatch");
@@ -2780,7 +2929,6 @@ pub fn run_example_app() {
         }
     }
 
-    let device = Device::Cpu;
     let (sender, inbox) = llm_action_channel::<DemoAction>();
 
     let tool_names = DemoAction::llm_tool_names();
@@ -2806,7 +2954,7 @@ pub fn run_example_app() {
 
     let state = app.world().resource::<DemoState>();
     println!(
-        "llm actions ready: device={device:?} tools={:?} tool_count={} score={} enemies={} debug={}",
+        "llm actions ready: tools={:?} tool_count={} score={} enemies={} debug={}",
         tool_names,
         tool_defs.len(),
         state.score,

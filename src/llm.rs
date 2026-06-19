@@ -1,28 +1,19 @@
-use crate::{LlmResponseMode, LlmWorldContext};
-use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::{
-    generation::LogitsProcessor,
-    models::{
-        llama::{Cache, Config as LlamaRuntimeConfig, Llama, LlamaConfig, LlamaEosToks},
-        quantized_llama::ModelWeights as QuantizedLlama,
-        quantized_qwen2::ModelWeights as QuantizedQwen2,
-    },
-    utils::apply_repeat_penalty,
-};
+use crate::{LlmResponseMode, LlmToolCallingMode, LlmToolDefinition, LlmWorldContext};
 use log::{debug, info};
-use rig_core::completion::ToolDefinition;
+use mistralrs::{
+    ChatCompletionResponse, Function, GgufModelBuilder, IsqBits, Model as MistralModel,
+    ModelBuilder as MistralAutoModelBuilder, RequestBuilder, SamplingParams, TextMessageRole,
+    TextMessages, TextModelBuilder, Tool, ToolCallResponse, ToolChoice, ToolType, best_device,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    fs,
-    io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
-use tokenizers::Tokenizer;
+use tokio::runtime::Runtime;
 
 /// Supported local model configurations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,8 +28,8 @@ pub enum LlmModel {
     Qwen2_5_1_5BInstructQ4KM,
     /// HuggingFaceTB/SmolLM3-3B quantized to Q4_K_M GGUF.
     ///
-    /// Candle 0.8.4 does not ship a SmolLM3 runtime backend yet, so selecting this
-    /// variant currently returns an unsupported-model error at load time.
+    /// This variant is kept for API stability. If the referenced GGUF artifact
+    /// is unavailable or unsupported by the runtime backend, loading fails fast.
     SmolLM3_3BQ4KM,
 }
 
@@ -79,9 +70,7 @@ impl LlmModel {
             Self::Qwen2_5_1_5BInstructQ4KM => ModelSourceKind::QuantizedLlamaGguf {
                 gguf_filename: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
             },
-            Self::SmolLM3_3BQ4KM => ModelSourceKind::Unsupported {
-                reason: "SmolLM3 uses a dedicated `smollm3` architecture, and Candle 0.8.4 does not provide a compatible runtime backend yet.",
-            },
+            Self::SmolLM3_3BQ4KM => ModelSourceKind::SmolLM3Q4,
         }
     }
 }
@@ -90,16 +79,17 @@ impl LlmModel {
 enum ModelSourceKind {
     DenseSafetensors,
     QuantizedLlamaGguf { gguf_filename: &'static str },
-    Unsupported { reason: &'static str },
+    SmolLM3Q4,
 }
 
-/// Runtime options for a named local Candle-backed LLM profile.
+/// Runtime options for a named local Mistral-backed LLM profile.
 #[derive(Debug, Clone)]
 pub struct LlmRuntimeProfileConfig {
     pub id: String,
     pub model: LlmModel,
     pub cache_dir: Option<PathBuf>,
     pub use_gpu: bool,
+    pub tool_calling: LlmToolCallingMode,
     pub worker_count: usize,
     pub seed: u64,
     pub temperature: Option<f64>,
@@ -116,6 +106,7 @@ impl Default for LlmRuntimeProfileConfig {
             model: LlmModel::SmolLM2_360MInstruct,
             cache_dir: None,
             use_gpu: false,
+            tool_calling: LlmToolCallingMode::Auto,
             worker_count: 2,
             seed: 42,
             temperature: Some(0.7),
@@ -142,7 +133,7 @@ impl Default for LlmTaskRoutingConfig {
     }
 }
 
-/// Runtime options for the local Candle-backed LLM worker profiles.
+/// Runtime options for the local Mistral-backed LLM worker profiles.
 #[derive(Debug, Clone)]
 pub struct LlmRuntimeConfig {
     pub profiles: Vec<LlmRuntimeProfileConfig>,
@@ -229,16 +220,10 @@ impl LlmRuntimeConfig {
 /// Errors produced by the runtime.
 #[derive(Debug, thiserror::Error)]
 pub enum LlmRuntimeError {
-    #[error("tokenizer error: {0}")]
-    Tokenizer(#[from] tokenizers::Error),
     #[error("serde json error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("candle error: {0}")]
-    Candle(#[from] candle_core::Error),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("http error: {0}")]
-    Http(#[from] ureq::Error),
+    #[error("mistral error: {0}")]
+    Mistral(String),
     #[error("model weights were not found in the repository cache")]
     MissingWeights,
     #[error("unsupported model configuration: {0}")]
@@ -260,11 +245,6 @@ pub enum LlmRuntimeError {
     InvalidTurn(String),
     #[error("generation cancelled")]
     Cancelled,
-}
-
-#[derive(Debug, Deserialize)]
-struct SafetensorsIndex {
-    weight_map: std::collections::HashMap<String, String>,
 }
 
 /// A tool call emitted by the model.
@@ -354,144 +334,97 @@ struct LlmFactExtractionJson {
     facts: Vec<LlmConversationFact>,
 }
 
-/// A single-model local runtime built on Candle.
+/// A single-model local runtime built on Mistral.rs.
 pub struct LlmRuntime {
-    model: LoadedModel,
-    tokenizer: Tokenizer,
-    device: Device,
-    eos_token: Option<u32>,
-    im_end_token: Option<u32>,
-    seed: u64,
+    model: MistralModel,
+    runtime: Runtime,
     temperature: Option<f64>,
     top_p: Option<f64>,
     repeat_penalty: f32,
-    repeat_last_n: usize,
     max_new_tokens: usize,
+    tool_calling: LlmToolCallingMode,
     profile_id: String,
     worker_index: usize,
 }
 
-enum LoadedModel {
-    Dense {
-        model: Llama,
-        model_config: LlamaRuntimeConfig,
-        dtype: DType,
-    },
-    QuantizedLlama {
-        model: QuantizedLlama,
-    },
-    QuantizedQwen2 {
-        model: QuantizedQwen2,
-    },
-}
-
 impl LlmRuntime {
-    /// Load the supported model from Hugging Face and warm the local cache.
+    /// Load the configured model and prepare the local async runtime.
     pub fn load(config: &LlmRuntimeProfileConfig) -> Result<Self, LlmRuntimeError> {
-        let cache_root = cache_root(config.cache_dir.clone());
-        let tokenizer_path = ensure_repo_file(
-            &cache_root,
-            config.model.tokenizer_repo_id(),
-            config.model.revision(),
-            "tokenizer.json",
-        )?;
-        let tokenizer = Tokenizer::from_file(tokenizer_path)?;
-        let im_end_token = tokenizer.get_vocab(true).get("<|im_end|>").copied();
-
-        let device = choose_device(config.use_gpu)?;
-        let (model, eos_token) = match config.model.source_kind() {
-            ModelSourceKind::DenseSafetensors => {
-                let config_path = ensure_repo_file(
-                    &cache_root,
-                    config.model.repo_id(),
-                    config.model.revision(),
-                    "config.json",
-                )?;
-                let config_json = fs::read_to_string(config_path)?;
-                let llama_hf_config: LlamaConfig = serde_json::from_str(&config_json)?;
-                let model_config = llama_hf_config.into_config(false);
-                let dtype = if matches!(device, Device::Cpu) {
-                    DType::F32
-                } else {
-                    DType::BF16
-                };
-
-                let revision_cache = repo_revision_cache(
-                    &cache_root,
-                    config.model.repo_id(),
-                    config.model.revision(),
-                )?;
-                let weight_files = resolve_weight_files(
-                    config.model.repo_id(),
-                    config.model.revision(),
-                    &revision_cache,
-                )?;
-                if weight_files.is_empty() {
-                    return Err(LlmRuntimeError::MissingWeights);
-                }
-
-                let vb =
-                    unsafe { VarBuilder::from_mmaped_safetensors(&weight_files, dtype, &device)? };
-                let model = Llama::load(vb, &model_config)?;
-                let eos_token =
-                    eos_token_id(&model_config).ok_or(LlmRuntimeError::MissingEosToken)?;
-                (
-                    LoadedModel::Dense {
-                        model,
-                        model_config,
-                        dtype,
-                    },
-                    eos_token,
-                )
-            }
-            ModelSourceKind::QuantizedLlamaGguf { gguf_filename } => {
-                let gguf_path = ensure_repo_file(
-                    &cache_root,
-                    config.model.repo_id(),
-                    config.model.revision(),
-                    gguf_filename,
-                )?;
-                let mut file = fs::File::open(&gguf_path)?;
-                let content = candle_core::quantized::gguf_file::Content::read(&mut file)?;
-                let model = match config.model {
-                    LlmModel::Qwen2_5_1_5BInstructQ2K | LlmModel::Qwen2_5_1_5BInstructQ4KM => {
-                        LoadedModel::QuantizedQwen2 {
-                            model: QuantizedQwen2::from_gguf(content, &mut file, &device)?,
-                        }
-                    }
-                    _ => LoadedModel::QuantizedLlama {
-                        model: QuantizedLlama::from_gguf(content, &mut file, &device)?,
-                    },
-                };
-                let eos_token = tokenizer
-                    .get_vocab(true)
-                    .get("<|im_end|>")
-                    .copied()
-                    .or_else(|| tokenizer.get_vocab(true).get("</s>").copied())
-                    .or_else(|| tokenizer.get_vocab(true).get("<|endoftext|>").copied())
-                    .ok_or(LlmRuntimeError::MissingEosToken)?;
-                (model, eos_token)
-            }
-            ModelSourceKind::Unsupported { reason } => {
-                return Err(LlmRuntimeError::UnsupportedModel(reason));
-            }
-        };
+        let runtime = Runtime::new().map_err(|err| LlmRuntimeError::Mistral(err.to_string()))?;
+        let model = runtime.block_on(Self::build_model(config))?;
 
         Ok(Self {
             model,
-            tokenizer,
-            device,
-            eos_token: Some(eos_token),
-            im_end_token,
-            seed: config.seed,
+            runtime,
             temperature: config.temperature,
             top_p: config.top_p,
             repeat_penalty: config.repeat_penalty,
-            repeat_last_n: config.repeat_last_n,
             max_new_tokens: config.max_new_tokens,
+            tool_calling: config.tool_calling.resolve_for_model(config.model),
             profile_id: config.id.clone(),
             worker_index: 0,
         })
+    }
+
+    async fn build_model(
+        config: &LlmRuntimeProfileConfig,
+    ) -> Result<MistralModel, LlmRuntimeError> {
+        let revision = config.model.revision();
+
+        let model = match config.model.source_kind() {
+            ModelSourceKind::DenseSafetensors => {
+                let builder =
+                    TextModelBuilder::new(config.model.repo_id()).with_hf_revision(revision);
+                let builder = if config.use_gpu {
+                    builder.with_device(
+                        best_device(false)
+                            .map_err(|err| LlmRuntimeError::Mistral(err.to_string()))?,
+                    )
+                } else {
+                    builder.with_force_cpu()
+                };
+                builder
+                    .build()
+                    .await
+                    .map_err(|err| LlmRuntimeError::Mistral(err.to_string()))?
+            }
+            ModelSourceKind::QuantizedLlamaGguf { gguf_filename } => {
+                let builder = GgufModelBuilder::new(config.model.repo_id(), vec![gguf_filename])
+                    .with_hf_revision(revision)
+                    .with_tok_model_id(config.model.tokenizer_repo_id());
+                let builder = if config.use_gpu {
+                    builder.with_device(
+                        best_device(false)
+                            .map_err(|err| LlmRuntimeError::Mistral(err.to_string()))?,
+                    )
+                } else {
+                    builder.with_force_cpu()
+                };
+                builder
+                    .build()
+                    .await
+                    .map_err(|err| LlmRuntimeError::Mistral(err.to_string()))?
+            }
+            ModelSourceKind::SmolLM3Q4 => {
+                let builder = MistralAutoModelBuilder::new(config.model.repo_id())
+                    .with_hf_revision(revision)
+                    .with_auto_isq(IsqBits::Four);
+                let builder = if config.use_gpu {
+                    builder.with_device(
+                        best_device(false)
+                            .map_err(|err| LlmRuntimeError::Mistral(err.to_string()))?,
+                    )
+                } else {
+                    builder.with_force_cpu()
+                };
+                builder
+                    .build()
+                    .await
+                    .map_err(|err| LlmRuntimeError::Mistral(err.to_string()))?
+            }
+        };
+
+        Ok(model)
     }
 
     pub(crate) fn with_worker_index(mut self, worker_index: usize) -> Self {
@@ -501,6 +434,52 @@ impl LlmRuntime {
 
     fn worker_tag(&self) -> String {
         format!("{}:{}", self.profile_id, self.worker_index)
+    }
+
+    fn apply_sampling(&self, request: RequestBuilder) -> RequestBuilder {
+        let mut params = if self.temperature.is_none() && self.top_p.is_none() {
+            SamplingParams::deterministic()
+        } else {
+            SamplingParams::neutral()
+        };
+        params.max_len = Some(self.max_new_tokens);
+        if let Some(temperature) = self.temperature {
+            params.temperature = Some(temperature);
+        }
+        if let Some(top_p) = self.top_p {
+            params.top_p = Some(top_p);
+        }
+        if self.repeat_penalty != 1.0 {
+            params.repetition_penalty = Some(self.repeat_penalty);
+        }
+
+        request.set_sampling(params)
+    }
+
+    fn send_messages(
+        &self,
+        messages: TextMessages,
+        tools: &[LlmToolDefinition],
+        allow_tools: bool,
+    ) -> Result<ChatCompletionResponse, LlmRuntimeError> {
+        let mut request = self.apply_sampling(messages.into());
+        if allow_tools && !tools.is_empty() && self.tool_calling != LlmToolCallingMode::Disabled {
+            let mistral_tools = tools
+                .iter()
+                .map(convert_tool_definition)
+                .collect::<Vec<_>>();
+            request = request
+                .set_tools(mistral_tools)
+                .set_tool_choice(ToolChoice::Auto);
+        }
+        let response = self.runtime.block_on(async {
+            self.model
+                .send_chat_request(request)
+                .await
+                .map_err(|err| LlmRuntimeError::Mistral(err.to_string()))
+        })?;
+
+        Ok(response)
     }
 
     pub fn refresh_conversation_facts(
@@ -533,185 +512,22 @@ impl LlmRuntime {
 
     /// Generate text for a prompt using the loaded model.
     pub fn generate(&mut self, prompt: &str) -> Result<String, LlmRuntimeError> {
-        let prompt = self.format_chat_prompt(prompt);
-        let response = self.generate_raw(&prompt, None)?;
-        Ok(response)
-    }
-
-    fn generate_raw(
-        &mut self,
-        prompt: &str,
-        cancel_flag: Option<&AtomicBool>,
-    ) -> Result<String, LlmRuntimeError> {
-        self.generate_raw_with_stop_tokens(prompt, cancel_flag, &[])
-    }
-
-    fn generate_raw_with_stop_tokens(
-        &mut self,
-        prompt: &str,
-        cancel_flag: Option<&AtomicBool>,
-        stop_tokens: &[u32],
-    ) -> Result<String, LlmRuntimeError> {
         debug!("llm worker {} raw generation started", self.worker_tag());
-        check_cancelled(cancel_flag)?;
-        let encoding = self.tokenizer.encode(prompt.to_string(), true)?;
-        let mut tokens = encoding.get_ids().to_vec();
-        if tokens.is_empty() {
-            debug!(
-                "llm worker {} raw generation produced empty token stream",
-                self.worker_tag()
-            );
-            return Ok(String::new());
-        }
-        let prompt_len = tokens.len();
-
-        let mut logits_processor = LogitsProcessor::new(self.seed, self.temperature, self.top_p);
-        let mut pos = 0;
         let started = Instant::now();
-        let worker_tag = self.worker_tag();
-        let mut stop_reason = String::from("max_new_tokens");
-        let eos_token = self.eos_token;
-        let tokenizer = self.tokenizer.clone();
-        match &mut self.model {
-            LoadedModel::Dense {
-                model,
-                model_config,
-                dtype,
-            } => {
-                let mut cache = Cache::new(true, *dtype, model_config, &self.device)?;
-                for index in 0..self.max_new_tokens {
-                    check_cancelled(cancel_flag)?;
-                    let context_size = if index > 0 { 1 } else { tokens.len() };
-                    let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let logits = model.forward(&input, pos, &mut cache)?.squeeze(0)?;
-                    let logits = if self.repeat_penalty == 1.0 {
-                        logits
-                    } else {
-                        let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                        apply_repeat_penalty(&logits, self.repeat_penalty, &tokens[start_at..])?
-                    };
-                    let next_token = logits_processor.sample(&logits)?;
-                    tokens.push(next_token);
-                    let token_text = self
-                        .tokenizer
-                        .decode(&[next_token], false)
-                        .unwrap_or_else(|_| String::from("<decode-error>"));
-                    debug!(
-                        "llm worker {} generated token {}/{} id={} text={:?}",
-                        worker_tag,
-                        index + 1,
-                        self.max_new_tokens,
-                        next_token,
-                        token_text
-                    );
-                    if let Some(reason) =
-                        should_stop_on_token(&tokenizer, eos_token, next_token, stop_tokens)
-                    {
-                        stop_reason = reason;
-                        break;
-                    }
-                    pos += context_size;
-                }
-            }
-            LoadedModel::QuantizedLlama { model } => {
-                let mut model = model.clone();
-                for index in 0..self.max_new_tokens {
-                    check_cancelled(cancel_flag)?;
-                    let context_size = if index > 0 { 1 } else { tokens.len() };
-                    let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let logits = model.forward(&input, pos)?.squeeze(0)?;
-                    let logits = if self.repeat_penalty == 1.0 {
-                        logits
-                    } else {
-                        let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                        apply_repeat_penalty(&logits, self.repeat_penalty, &tokens[start_at..])?
-                    };
-                    let next_token = logits_processor.sample(&logits)?;
-                    tokens.push(next_token);
-                    let token_text = self
-                        .tokenizer
-                        .decode(&[next_token], false)
-                        .unwrap_or_else(|_| String::from("<decode-error>"));
-                    debug!(
-                        "llm worker {} generated token {}/{} id={} text={:?}",
-                        worker_tag,
-                        index + 1,
-                        self.max_new_tokens,
-                        next_token,
-                        token_text
-                    );
-                    if let Some(reason) =
-                        should_stop_on_token(&tokenizer, eos_token, next_token, stop_tokens)
-                    {
-                        stop_reason = reason;
-                        break;
-                    }
-                    pos += context_size;
-                }
-            }
-            LoadedModel::QuantizedQwen2 { model } => {
-                for index in 0..self.max_new_tokens {
-                    check_cancelled(cancel_flag)?;
-                    let context_size = if index > 0 { 1 } else { tokens.len() };
-                    let ctxt = &tokens[tokens.len().saturating_sub(context_size)..];
-                    let input = Tensor::new(ctxt, &self.device)?.unsqueeze(0)?;
-                    let logits = model.forward(&input, pos)?.squeeze(0)?;
-                    let logits = if self.repeat_penalty == 1.0 {
-                        logits
-                    } else {
-                        let start_at = tokens.len().saturating_sub(self.repeat_last_n);
-                        apply_repeat_penalty(&logits, self.repeat_penalty, &tokens[start_at..])?
-                    };
-                    let next_token = logits_processor.sample(&logits)?;
-                    tokens.push(next_token);
-                    let token_text = self
-                        .tokenizer
-                        .decode(&[next_token], false)
-                        .unwrap_or_else(|_| String::from("<decode-error>"));
-                    debug!(
-                        "llm worker {} generated token {}/{} id={} text={:?}",
-                        worker_tag,
-                        index + 1,
-                        self.max_new_tokens,
-                        next_token,
-                        token_text
-                    );
-                    if let Some(reason) =
-                        should_stop_on_token(&tokenizer, eos_token, next_token, stop_tokens)
-                    {
-                        stop_reason = reason;
-                        break;
-                    }
-                    pos += context_size;
-                }
-            }
-        }
-
-        let generated = &tokens[prompt_len..];
-        let generated = if generated
-            .last()
-            .is_some_and(|token| Some(*token) == self.eos_token || stop_tokens.contains(token))
-        {
-            &generated[..generated.len().saturating_sub(1)]
-        } else {
-            generated
-        };
-        let decoded = self.tokenizer.decode(generated, true)?;
-        let raw_decoded = self
-            .tokenizer
-            .decode(generated, false)
-            .unwrap_or_else(|_| String::from("<decode-error>"));
+        let messages = TextMessages::new().add_message(TextMessageRole::User, prompt);
+        let response = self.send_messages(messages, &[], false)?;
+        let response = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.clone())
+            .unwrap_or_default();
         debug!(
-            "llm worker {} raw generation finished in {:?}; stop_reason={}; visible_output={}; raw_output={:?}",
+            "llm worker {} raw generation finished in {:?}; output={:?}",
             self.worker_tag(),
             started.elapsed(),
-            stop_reason,
-            decoded,
-            raw_decoded
+            response
         );
-        Ok(decoded)
+        Ok(response)
     }
 
     fn extract_facts_from_input(
@@ -727,7 +543,20 @@ impl LlmRuntime {
             self.worker_tag(),
             prompt
         );
-        let response = self.generate_raw(&prompt, cancel_flag)?;
+        check_cancelled(cancel_flag)?;
+        let messages = TextMessages::new()
+            .add_message(
+                TextMessageRole::System,
+                "Extract durable facts from the user-provided conversation updates. Return only JSON.",
+            )
+            .add_message(TextMessageRole::User, prompt);
+        let response = self.send_messages(messages, &[], false)?;
+        let response = response
+            .choices
+            .first()
+            .and_then(|choice| choice.message.content.as_deref())
+            .unwrap_or_default()
+            .to_string();
         let facts = parse_fact_extraction_response(&response);
         info!(
             "llm worker {} fact extraction finished in {:?}; new_facts={}",
@@ -756,12 +585,14 @@ impl LlmRuntime {
         response_mode: LlmResponseMode,
         cancel_flag: Option<&AtomicBool>,
         facts: &[LlmConversationFact],
-        tools: &[ToolDefinition],
+        tools: &[LlmToolDefinition],
         world: Option<&LlmWorldContext>,
         conversation: Option<&LlmConversationState>,
         session_participants: Option<&[String]>,
         speaker_labels: Option<&HashMap<String, String>>,
     ) -> Result<LlmTurn, LlmRuntimeError> {
+        let system_prompt =
+            self.build_turn_system_prompt(agent, response_mode, tools, world, session_participants);
         let prompt = self.build_turn_prompt(
             agent,
             prompt,
@@ -782,17 +613,23 @@ impl LlmRuntime {
             response_mode,
             prompt
         );
-        let response = match response_mode {
-            LlmResponseMode::PlainTextChat => {
-                let mut stop_tokens = Vec::new();
-                if let Some(im_end_token) = self.im_end_token {
-                    stop_tokens.push(im_end_token);
-                }
-                self.generate_raw_with_stop_tokens(&prompt, cancel_flag, &stop_tokens)?
-            }
-            LlmResponseMode::StructuredJson => self.generate_raw(&prompt, cancel_flag)?,
-        };
-        let turn = self.parse_turn(agent, conversation_id, response_mode, world, &response)?;
+        check_cancelled(cancel_flag)?;
+        let messages = TextMessages::new()
+            .add_message(TextMessageRole::System, system_prompt)
+            .add_message(TextMessageRole::User, prompt);
+        let response = self.send_messages(
+            messages,
+            tools,
+            response_mode != LlmResponseMode::PlainTextChat,
+        )?;
+        let turn = self.parse_turn(
+            agent,
+            conversation_id,
+            response_mode,
+            tools,
+            world,
+            &response,
+        )?;
         debug!(
             "llm worker {} turn generation finished in {:?}; agent={} conversation={:?} mode={:?}",
             self.worker_tag(),
@@ -836,30 +673,26 @@ impl LlmRuntime {
         Ok(turn)
     }
 
-    fn build_turn_prompt(
+    fn build_turn_system_prompt(
         &self,
         agent: &str,
-        prompt: &str,
         response_mode: LlmResponseMode,
-        facts: &[LlmConversationFact],
-        tools: &[ToolDefinition],
+        tools: &[LlmToolDefinition],
         world: Option<&LlmWorldContext>,
-        conversation: Option<&LlmConversationState>,
         session_participants: Option<&[String]>,
-        speaker_labels: Option<&HashMap<String, String>>,
     ) -> String {
-        let (response_contract, tool_block) = match response_mode {
+        match response_mode {
             LlmResponseMode::StructuredJson => {
                 let tool_block = if tools.is_empty() {
                     String::from("No tools are available for this request.")
                 } else {
                     let mut lines = Vec::with_capacity(tools.len());
                     for tool in tools {
-                        let schema = serde_json::to_string(&tool.parameters)
-                            .unwrap_or_else(|_| String::from("{}"));
                         lines.push(format!(
                             "- tool: {}\n  description: {}\n  arguments schema: {}",
-                            tool.name, tool.description, schema
+                            tool.name,
+                            tool.description,
+                            format_json(&tool.parameters)
                         ));
                     }
                     if tools.len() == 1 {
@@ -875,30 +708,109 @@ impl LlmRuntime {
 
                 let response_contract = if tools.is_empty() {
                     String::from(
-                        "Return exactly one JSON object.\n\
-No extra text.\n\
-No tools are available for this request.\n\
-Respond with a JSON object containing only `response`.\n\
-Never return `tool_calls`.\n",
+                        "Return exactly one JSON object.\nNo extra text.\nNo tools are available for this request.\nRespond with a JSON object containing only `response`.\nNever return `tool_calls`.\n",
                     )
                 } else {
                     String::from(
-                        "Return exactly one JSON object.\n\
-No extra text.\n\
-If calling tools, respond with a JSON object containing only a `tool_calls` array.\n\
-Each entry must have `tool` and `arguments` fields.\n\
-If not calling tools, respond with a JSON object containing only `response`.\n\
-Never include both fields.\n\
-Use exact tool names only.\n",
+                        "Speak only in the response text.\nIf you need to act, use the provided tools instead of narrating the action.\nKeep tool calls separate from spoken dialogue.\n",
                     )
                 };
 
-                (response_contract, tool_block)
+                let mut system = format!(
+                    "Agent: {agent}\n{response_contract}World context:\n",
+                    response_contract = response_contract
+                );
+                system.push_str(&match world {
+                    Some(world) => format!(
+                        "{}\n\nWorld fields:\n{}",
+                        format_json(&world.world_view),
+                        format_schema_guide(&world.world_schema),
+                    ),
+                    None => String::from("No world state snapshot is available for this agent."),
+                });
+                system.push_str(
+                    "\nMemory facts and conversation history are supplied in the user message.\n",
+                );
+                if let Some(participants) = session_participants {
+                    if !participants.is_empty() {
+                        system.push_str(&format!("Nearby people: {}\n", participants.join(", ")));
+                    }
+                }
+                if !tools.is_empty() {
+                    system.push_str(match self.tool_calling_mode_for_prompt() {
+                        LlmToolCallingMode::Disabled => {
+                            "Tools are configured but disabled for this profile.\n"
+                        }
+                        LlmToolCallingMode::Auto | LlmToolCallingMode::Native => {
+                            "Use native model tool calling when an action is required.\n"
+                        }
+                        LlmToolCallingMode::AgenticXml => {
+                            "Use agentic XML-style tool calling when an action is required.\n"
+                        }
+                        LlmToolCallingMode::Python => {
+                            "Use python-style tool calling when an action is required.\n"
+                        }
+                    });
+                }
+                system.push_str(&tool_block);
+                system
             }
-            LlmResponseMode::PlainTextChat => (
-                build_plain_text_chat_response_preamble(agent, world, session_participants),
-                String::from("Tools are disabled for this local chat request."),
-            ),
+            LlmResponseMode::PlainTextChat => {
+                let mut system = format!(
+                    "{}Tools are disabled for this local chat request.\nOutput contract:\nReply with message text only.\nDo not include your name, speaker label, markdown, or surrounding quotes.\nIf your reply would only repeat memory facts or restate something already said, reply exactly `SILENT`.\nIf you have nothing useful to say, reply exactly `SILENT`.\nAccepted legacy format: `{}`.\n",
+                    build_plain_text_chat_response_preamble(agent, world, session_participants),
+                    expected_plain_text_chat_response_format(agent, world),
+                );
+                if let Some(participants) = session_participants {
+                    if !participants.is_empty() {
+                        system.push_str(&format!("Nearby people: {}\n", participants.join(", ")));
+                    }
+                }
+                system
+            }
+        }
+    }
+
+    fn build_turn_prompt(
+        &self,
+        agent: &str,
+        prompt: &str,
+        response_mode: LlmResponseMode,
+        facts: &[LlmConversationFact],
+        tools: &[LlmToolDefinition],
+        world: Option<&LlmWorldContext>,
+        conversation: Option<&LlmConversationState>,
+        session_participants: Option<&[String]>,
+        speaker_labels: Option<&HashMap<String, String>>,
+    ) -> String {
+        let tool_block = match response_mode {
+            LlmResponseMode::StructuredJson => {
+                if tools.is_empty() {
+                    String::from("No tools are available for this request.")
+                } else {
+                    let mut lines = Vec::with_capacity(tools.len());
+                    for tool in tools {
+                        lines.push(format!(
+                            "- tool: {}\n  description: {}\n  arguments schema: {}",
+                            tool.name,
+                            tool.description,
+                            format_json(&tool.parameters)
+                        ));
+                    }
+                    if tools.len() == 1 {
+                        format!(
+                            "Available tools:\n{}\nOnly valid tool name for this request: {}",
+                            lines.join("\n"),
+                            tools[0].name
+                        )
+                    } else {
+                        format!("Available tools:\n{}", lines.join("\n"))
+                    }
+                }
+            }
+            LlmResponseMode::PlainTextChat => {
+                String::from("Tools are disabled for this local chat request.")
+            }
         };
 
         let world_block = match world {
@@ -917,47 +829,26 @@ Use exact tool names only.\n",
 
         let fact_block = format_fact_memory(facts);
 
-        let content = match response_mode {
+        match response_mode {
             LlmResponseMode::StructuredJson => format!(
-                "Agent: {agent}\n\
-{response_contract}\
-World context:\n\
-{world_block}\n\
-Memory facts:\n\
-{fact_block}\n\
-Conversation context:\n\
-{conversation_block}\n\
-{tool_block}\n\
-Game prompt:\n\
-{prompt}\n\
-",
-                response_contract = response_contract,
-                world_block = world_block,
-                fact_block = fact_block,
-                conversation_block = conversation_block,
-                tool_block = tool_block,
+                "World context:\n{world_block}\n\nMemory facts:\n{fact_block}\n\nConversation context:\n{conversation_block}\n\n{tool_block}\n\nGame prompt:\n{prompt}\n",
             ),
-            LlmResponseMode::PlainTextChat => {
-                return self.build_plain_text_chat_prompt(
-                    agent,
-                    &response_contract,
-                    &fact_block,
-                    conversation,
-                    prompt,
-                    world,
-                    session_participants,
-                    speaker_labels,
-                );
-            }
-        };
-        self.format_chat_prompt(&content)
+            LlmResponseMode::PlainTextChat => self.build_plain_text_chat_prompt(
+                agent,
+                &tool_block,
+                conversation,
+                prompt,
+                world,
+                session_participants,
+                speaker_labels,
+            ),
+        }
     }
 
     fn build_plain_text_chat_prompt(
         &self,
         agent: &str,
-        response_contract: &str,
-        _fact_block: &str,
+        _tool_block: &str,
         conversation: Option<&LlmConversationState>,
         prompt: &str,
         world: Option<&LlmWorldContext>,
@@ -965,26 +856,16 @@ Game prompt:\n\
         speaker_labels: Option<&HashMap<String, String>>,
     ) -> String {
         let speaker_label = plain_text_chat_speaker_label(agent, world);
-        let mut prompt_sections = vec![chatml_message(
-            "system",
-            &format!(
-                "{response_contract}Tools are disabled for this local chat request.\nCurrent prompt:\n{prompt}\n\nOutput contract:\nReply with message text only.\nDo not include your name, speaker label, markdown, or surrounding quotes.\nIf your reply would only repeat memory facts or restate something already said, reply exactly `SILENT`.\nIf you have nothing useful to say, reply exactly `SILENT`.\nAccepted legacy format: `{}`.\n",
-                expected_plain_text_chat_response_format(agent, world),
-            ),
-        )];
-
+        let mut sections = Vec::new();
         if let Some(participants) = session_participants {
             if !participants.is_empty() {
-                prompt_sections.push(chatml_message(
-                    "system",
-                    &format!("Nearby people: {}", participants.join(", ")),
-                ));
+                sections.push(format!("Nearby people: {}", participants.join(", ")));
             }
         }
 
         if let Some(conversation) = conversation {
             for entry in &conversation.entries {
-                prompt_sections.push(render_plain_text_chat_entry(
+                sections.push(render_plain_text_chat_entry(
                     agent,
                     entry,
                     world,
@@ -993,15 +874,11 @@ Game prompt:\n\
             }
         }
 
-        prompt_sections.push(format!(
-            "<|im_start|>assistant\n{}",
-            plain_text_chat_opening_cue(&speaker_label)
+        sections.push(format!(
+            "Respond as {speaker_label}. Continue the conversation with message text only. If everything important has already been covered, reply with SILENT.\n"
         ));
-        prompt_sections.join("\n")
-    }
-
-    fn format_chat_prompt(&self, user_content: &str) -> String {
-        format!("<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n")
+        sections.push(format!("Current prompt:\n{prompt}"));
+        sections.join("\n")
     }
 
     fn build_fact_extraction_prompt(
@@ -1009,8 +886,7 @@ Game prompt:\n\
         extraction_input: &str,
         world: Option<&LlmWorldContext>,
     ) -> String {
-        let content = build_fact_extraction_prompt_content(extraction_input, world);
-        self.format_chat_prompt(&content)
+        build_fact_extraction_prompt_content(extraction_input, world)
     }
 
     fn parse_turn(
@@ -1018,10 +894,18 @@ Game prompt:\n\
         agent: &str,
         conversation_id: Option<&str>,
         response_mode: LlmResponseMode,
+        tools: &[LlmToolDefinition],
         world: Option<&LlmWorldContext>,
-        output: &str,
+        response: &ChatCompletionResponse,
     ) -> Result<LlmTurn, LlmRuntimeError> {
-        let cleaned = strip_code_fences(output).trim().to_string();
+        let message = response
+            .choices
+            .first()
+            .map(|choice| &choice.message)
+            .ok_or_else(|| LlmRuntimeError::InvalidTurn(String::from("empty response")))?;
+        let cleaned = strip_code_fences(message.content.as_deref().unwrap_or(""))
+            .trim()
+            .to_string();
         debug!(
             "llm worker {} parsed candidate output: {}",
             self.worker_tag(),
@@ -1033,41 +917,53 @@ Game prompt:\n\
                 agent: agent.to_string(),
                 conversation_id: conversation_id.map(str::to_string),
                 response: normalize_plain_text_chat_response(agent, world, &cleaned),
-                tool_calls: Vec::new(),
+                tool_calls: parse_mistral_tool_calls(message.tool_calls.as_ref(), tools),
+            });
+        }
+
+        let tool_calls = parse_mistral_tool_calls(message.tool_calls.as_ref(), tools);
+        if !tool_calls.is_empty() {
+            return Ok(LlmTurn {
+                agent: agent.to_string(),
+                conversation_id: conversation_id.map(str::to_string),
+                response: cleaned,
+                tool_calls,
             });
         }
 
         let json_objects = extract_json_objects(&cleaned);
         if !json_objects.is_empty() {
-            let mut response = None;
-            let mut tool_calls = Vec::new();
+            let mut response_text = None;
+            let mut parsed_tool_calls = Vec::new();
 
             for candidate in json_objects {
                 if let Ok(json) = serde_json::from_str::<LlmTurnJson>(candidate) {
                     let has_turn_fields = json.response.is_some() || !json.tool_calls.is_empty();
                     if has_turn_fields {
-                        if response.is_none() {
-                            response = json.response;
+                        if response_text.is_none() {
+                            response_text = json.response;
                         }
-                        tool_calls.extend(json.tool_calls.into_iter().map(|call| LlmToolCall {
-                            tool: call.tool,
-                            arguments: call.arguments,
+                        parsed_tool_calls.extend(json.tool_calls.into_iter().map(|call| {
+                            LlmToolCall {
+                                tool: call.tool,
+                                arguments: call.arguments,
+                            }
                         }));
                         continue;
                     }
                 }
 
                 if let Ok(call) = serde_json::from_str::<LlmToolCallJson>(candidate) {
-                    tool_calls.push(LlmToolCall {
+                    parsed_tool_calls.push(LlmToolCall {
                         tool: call.tool,
                         arguments: call.arguments,
                     });
                 }
             }
 
-            if response.is_some() || !tool_calls.is_empty() {
-                let response = if tool_calls.is_empty() {
-                    response.unwrap_or_default()
+            if response_text.is_some() || !parsed_tool_calls.is_empty() {
+                let response = if parsed_tool_calls.is_empty() {
+                    response_text.unwrap_or_default()
                 } else {
                     String::new()
                 };
@@ -1075,13 +971,13 @@ Game prompt:\n\
                     "llm worker {} parsed structured turn: response_len={} tool_calls={}",
                     self.worker_tag(),
                     response.len(),
-                    tool_calls.len()
+                    parsed_tool_calls.len()
                 );
                 return Ok(LlmTurn {
                     agent: agent.to_string(),
                     conversation_id: conversation_id.map(str::to_string),
                     response,
-                    tool_calls,
+                    tool_calls: parsed_tool_calls,
                 });
             }
         }
@@ -1090,8 +986,12 @@ Game prompt:\n\
             agent: agent.to_string(),
             conversation_id: conversation_id.map(str::to_string),
             response: cleaned,
-            tool_calls: Vec::new(),
+            tool_calls,
         })
+    }
+
+    fn tool_calling_mode_for_prompt(&self) -> LlmToolCallingMode {
+        self.tool_calling
     }
 }
 
@@ -1201,12 +1101,6 @@ fn expected_plain_text_chat_response_format(
     format!("**{speaker}:** {{message}}")
 }
 
-fn plain_text_chat_opening_cue(speaker_label: &str) -> String {
-    format!(
-        "Respond as {speaker_label}. Continue the conversation with message text only. If everything important has already been covered, reply with SILENT.\n"
-    )
-}
-
 fn normalize_plain_text_chat_response(
     agent: &str,
     world: Option<&LlmWorldContext>,
@@ -1234,27 +1128,6 @@ fn normalize_plain_text_chat_response(
     output.to_string()
 }
 
-fn should_stop_on_token(
-    tokenizer: &Tokenizer,
-    eos_token: Option<u32>,
-    token: u32,
-    stop_tokens: &[u32],
-) -> Option<String> {
-    if Some(token) == eos_token {
-        return Some(format!("eos_token({token})"));
-    }
-    if stop_tokens.contains(&token) {
-        return Some(format!("stop_token({token})"));
-    }
-
-    let decoded = tokenizer.decode(&[token], false).ok()?;
-    if decoded.is_empty() {
-        return Some(format!("empty_special_token({token})"));
-    }
-
-    None
-}
-
 fn strip_plain_text_chat_speaker_prefix(output: &str, accepted_labels: &[&str]) -> Option<String> {
     let content = output.strip_prefix("**")?;
     for separator in ["**:", ":**"] {
@@ -1277,124 +1150,6 @@ fn world_view_string_field<'a>(world: Option<&'a LlmWorldContext>, key: &str) ->
         .and_then(|view| view.get(key))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-}
-
-fn choose_device(use_gpu: bool) -> Result<Device, candle_core::Error> {
-    if use_gpu && candle_core::utils::cuda_is_available() {
-        Ok(Device::new_cuda(0)?)
-    } else if use_gpu && candle_core::utils::metal_is_available() {
-        Ok(Device::new_metal(0)?)
-    } else {
-        Ok(Device::Cpu)
-    }
-}
-
-fn resolve_weight_files(
-    repo_id: &str,
-    revision: &str,
-    revision_cache: &Path,
-) -> Result<Vec<PathBuf>, LlmRuntimeError> {
-    let index_path = ensure_file(
-        repo_id,
-        revision,
-        "model.safetensors.index.json",
-        revision_cache,
-    );
-    if let Ok(index_path) = index_path {
-        let index_json = fs::read_to_string(index_path)?;
-        let index: SafetensorsIndex = serde_json::from_str(&index_json)?;
-        let files = index
-            .weight_map
-            .into_values()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|filename| ensure_file(repo_id, revision, &filename, revision_cache))
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(files);
-    }
-
-    if let Ok(single_file) = ensure_file(repo_id, revision, "model.safetensors", revision_cache) {
-        return Ok(vec![single_file]);
-    }
-
-    Ok(Vec::new())
-}
-
-fn ensure_repo_file(
-    cache_root: &Path,
-    repo_id: &str,
-    revision: &str,
-    filename: &str,
-) -> Result<PathBuf, LlmRuntimeError> {
-    let revision_cache = repo_revision_cache(cache_root, repo_id, revision)?;
-    ensure_file(repo_id, revision, filename, &revision_cache)
-}
-
-fn repo_revision_cache(
-    cache_root: &Path,
-    repo_id: &str,
-    revision: &str,
-) -> Result<PathBuf, LlmRuntimeError> {
-    let revision_cache = cache_root.join(safe_repo_id(repo_id)).join(revision);
-    fs::create_dir_all(&revision_cache)?;
-    Ok(revision_cache)
-}
-
-fn ensure_file(
-    repo_id: &str,
-    revision: &str,
-    filename: &str,
-    revision_cache: &Path,
-) -> Result<PathBuf, LlmRuntimeError> {
-    let local_path = revision_cache.join(filename);
-    if local_path.exists() {
-        return Ok(local_path);
-    }
-
-    let url = format!("https://huggingface.co/{repo_id}/resolve/{revision}/{filename}");
-    let response = ureq::get(&url).call()?;
-
-    if let Some(parent) = local_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    let mut reader = response.into_reader();
-    let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes)?;
-
-    let mut file = fs::File::create(&local_path)?;
-    file.write_all(&bytes)?;
-    Ok(local_path)
-}
-
-fn cache_root(cache_dir: Option<PathBuf>) -> PathBuf {
-    match cache_dir {
-        Some(cache_dir) => cache_dir,
-        None => {
-            let mut root = std::env::var_os("HF_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dirs_cache_dir().unwrap_or_else(|| PathBuf::from(".cache")));
-            root.push("bevellm");
-            root.push("hf");
-            root
-        }
-    }
-}
-
-fn dirs_cache_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))
-}
-
-fn safe_repo_id(repo_id: &str) -> String {
-    repo_id.replace('/', "__")
-}
-
-fn eos_token_id(config: &LlamaRuntimeConfig) -> Option<u32> {
-    match &config.eos_token_id {
-        Some(LlamaEosToks::Single(token)) => Some(*token),
-        Some(LlamaEosToks::Multiple(tokens)) => tokens.first().copied(),
-        None => None,
-    }
 }
 
 fn strip_code_fences(output: &str) -> String {
@@ -1457,7 +1212,7 @@ fn extract_json_objects(output: &str) -> Vec<&str> {
 fn normalize_and_filter_tool_calls(
     mut turn: LlmTurn,
     response_mode: LlmResponseMode,
-    tools: &[ToolDefinition],
+    tools: &[LlmToolDefinition],
 ) -> LlmTurn {
     if response_mode == LlmResponseMode::PlainTextChat || tools.is_empty() {
         turn.tool_calls.clear();
@@ -1483,6 +1238,62 @@ fn normalize_and_filter_tool_calls(
     turn.tool_calls.retain(|call| call.tool == only_tool);
 
     turn
+}
+
+fn convert_tool_definition(tool: &LlmToolDefinition) -> Tool {
+    let parameters = tool
+        .parameters
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+
+    Tool {
+        tp: ToolType::Function,
+        function: Function {
+            description: Some(tool.description.clone()),
+            name: tool.name.clone(),
+            parameters: if parameters.is_empty() {
+                None
+            } else {
+                Some(parameters)
+            },
+        },
+    }
+}
+
+fn parse_mistral_tool_calls(
+    tool_calls: Option<&Vec<ToolCallResponse>>,
+    allowed_tools: &[LlmToolDefinition],
+) -> Vec<LlmToolCall> {
+    let Some(tool_calls) = tool_calls else {
+        return Vec::new();
+    };
+    if allowed_tools.is_empty() {
+        return Vec::new();
+    }
+
+    let allowed = allowed_tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect::<HashSet<_>>();
+
+    tool_calls
+        .iter()
+        .filter_map(|call| {
+            if !allowed.is_empty() && !allowed.contains(call.function.name.as_str()) {
+                return None;
+            }
+
+            let arguments = serde_json::from_str::<Value>(&call.function.arguments)
+                .unwrap_or_else(|_| Value::String(call.function.arguments.clone()));
+            Some(LlmToolCall {
+                tool: call.function.name.clone(),
+                arguments,
+            })
+        })
+        .collect()
 }
 
 fn format_json(value: &Value) -> String {

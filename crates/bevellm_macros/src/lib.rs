@@ -24,7 +24,6 @@ fn expand_llm_actions(input: DeriveInput) -> Result<proc_macro2::TokenStream> {
     let mut variant_tokens = Vec::new();
     let mut tool_name_literals = Vec::new();
     let mut tool_definition_exprs = Vec::new();
-    let mut tool_box_exprs = Vec::new();
 
     for variant in data_enum.variants {
         let variant_ident = variant.ident;
@@ -38,13 +37,12 @@ fn expand_llm_actions(input: DeriveInput) -> Result<proc_macro2::TokenStream> {
             )
         });
 
-        let tool_struct_ident = format_ident!("__llm_actions_{}_{}", enum_ident, variant_ident);
         let args_struct_ident =
             format_ident!("__llm_actions_{}_{}_args", enum_ident, variant_ident);
 
         let variant_span = variant_ident.span();
 
-        let (field_defs, _field_idents, field_value_tokens) = match variant.fields {
+        let (field_defs, _field_idents, _field_value_tokens) = match variant.fields {
             Fields::Named(fields_named) => {
                 let mut defs = Vec::new();
                 let mut idents = Vec::new();
@@ -96,72 +94,18 @@ fn expand_llm_actions(input: DeriveInput) -> Result<proc_macro2::TokenStream> {
             }
         };
 
-        let action_expr = if field_value_tokens.is_empty() {
-            quote! { #enum_ident::#variant_ident }
-        } else {
-            quote! { #enum_ident::#variant_ident { #(#field_value_tokens),* } }
-        };
-
         variant_tokens.push(quote! {
             #args_struct
-
-            #[allow(non_camel_case_types)]
-            #[derive(Clone, Debug)]
-            struct #tool_struct_ident {
-                sender: ::std::sync::mpsc::Sender<#enum_ident>,
-            }
-
-            impl #tool_struct_ident {
-                fn new(sender: ::std::sync::mpsc::Sender<#enum_ident>) -> Self {
-                    Self { sender }
-                }
-
-                fn definition() -> ::rig_core::completion::ToolDefinition {
-                    let parameters = ::serde_json::to_value(::schemars::schema_for!(#args_struct_ident))
-                        .expect("LLMActions tool schemas must serialize");
-
-                    ::rig_core::completion::ToolDefinition {
-                        name: #tool_name.to_string(),
-                        description: #tool_description.to_string(),
-                        parameters,
-                    }
-                }
-            }
-
-            impl ::rig_core::tool::Tool for #tool_struct_ident {
-                const NAME: &'static str = #tool_name;
-
-                type Error = ::bevellm::LLMActionError;
-                type Args = #args_struct_ident;
-                type Output = String;
-
-                fn definition(
-                    &self,
-                    _prompt: String,
-                ) -> impl ::std::future::Future<Output = ::rig_core::completion::ToolDefinition> {
-                    async move { Self::definition() }
-                }
-
-                fn call(
-                    &self,
-                    args: Self::Args,
-                ) -> impl ::std::future::Future<Output = ::std::result::Result<Self::Output, Self::Error>> {
-                    let sender = self.sender.clone();
-                    async move {
-                        let action = #action_expr;
-                        sender
-                            .send(action)
-                            .map_err(|err| ::bevellm::LLMActionError::Dispatch(err.to_string()))?;
-                        Ok(format!("queued {}", Self::NAME))
-                    }
-                }
-            }
         });
 
-        tool_name_literals.push(tool_name);
-        tool_definition_exprs.push(quote! { #tool_struct_ident::definition() });
-        tool_box_exprs.push(quote! {
-            Box::new(#tool_struct_ident::new(sender.clone())) as Box<dyn ::rig_core::tool::ToolDyn>
+        tool_name_literals.push(tool_name.clone());
+        tool_definition_exprs.push(quote! {
+            ::bevellm::LlmToolDefinition::new(
+                #tool_name,
+                #tool_description,
+                ::serde_json::to_value(::schemars::schema_for!(#args_struct_ident))
+                    .expect("LLMActions tool schemas must serialize"),
+            )
         });
     }
 
@@ -171,14 +115,22 @@ fn expand_llm_actions(input: DeriveInput) -> Result<proc_macro2::TokenStream> {
                 &[#(#tool_name_literals),*]
             }
 
-            pub fn llm_tool_definitions() -> ::std::vec::Vec<::rig_core::completion::ToolDefinition> {
+            pub fn llm_tool_definitions() -> ::std::vec::Vec<::bevellm::LlmToolDefinition> {
                 vec![#(#tool_definition_exprs),*]
             }
 
             pub fn llm_tool_set(
                 sender: ::std::sync::mpsc::Sender<Self>,
-            ) -> ::rig_core::tool::ToolSet {
-                ::rig_core::tool::ToolSet::from_tools_boxed(vec![#(#tool_box_exprs),*])
+            ) -> ::bevellm::LlmToolSet {
+                let _ = sender;
+                ::bevellm::LlmToolSet::new(
+                    vec![
+                        #(
+                            ::std::string::ToString::to_string(#tool_name_literals)
+                        ),*
+                    ],
+                    vec![#(#tool_definition_exprs),*],
+                )
             }
         }
 

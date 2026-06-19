@@ -3,8 +3,9 @@ use bevellm::conversation::{
     ParticipantFactLedger, print_fact_ledger,
 };
 use bevellm::{
-    LLMAgent, LLMAgentWorld, LlmConversationCommand, LlmConversationGenerationCommand, LlmModel,
-    LlmRuntimeConfig, LlmRuntimePlugin, LlmRuntimeProfileConfig, LlmTaskRoutingConfig,
+    LLMAgent, LLMAgentWorld, LlmConversationCommand, LlmConversationGenerationCommand,
+    LlmConversationGenerationEvent, LlmModel, LlmRuntimeConfig, LlmRuntimePlugin,
+    LlmRuntimeProfileConfig, LlmTaskRoutingConfig, LlmToolCall, LlmToolCallingMode,
     install_llm_world_sync,
 };
 use bevy_app::{App, Startup, Update};
@@ -22,12 +23,33 @@ const BRAVO_ID: &str = "agent_bravo";
 const FIRST_SESSION_ID: &str = "alpha_bravo_patrol";
 const SECOND_SESSION_ID: &str = "alpha_bravo_patrol_followup";
 const HEARING_RANGE: f32 = 3.0;
+const PATROL_ACTION_TOOL_SCHEMA: &str = r#"Available patrol action tools for proposed actions:
+- warn_about_exposed_path {"path":"eastern"|"western"|"bridge","severity":"low"|"medium"|"high"}
+- hold_position {"agent":"agent_alpha"|"agent_bravo","reason":"short reason"}
+- secure_bridge_approach {"leader":"agent_alpha"|"agent_bravo","approach":"east"|"west"|"center"}
+- mark_sight_line {"path":"eastern"|"western"|"bridge","threat":"short description"}
+
+When a participant wants to do one of these actions, put it in that utterance's tool_calls array.
+If the utterance includes spoken dialogue, keep that dialogue in text and put the action in tool_calls.
+Only leave text empty when the beat is purely an action with no spoken line.
+Do not narrate action intent in text."#;
 
 #[derive(Resource, Default)]
 struct DemoStatus {
     started_at: Option<Instant>,
     first_round_requested: bool,
     second_round_requested: bool,
+}
+
+#[derive(Debug, Clone, Default, Resource)]
+struct ToolCallProbe {
+    calls_by_session: HashMap<String, Vec<SpeakerToolCall>>,
+}
+
+#[derive(Debug, Clone)]
+struct SpeakerToolCall {
+    speaker: String,
+    call: LlmToolCall,
 }
 
 #[derive(Resource, Default)]
@@ -264,10 +286,16 @@ fn sync_proximity_world_and_chat(
             commands.send(request_generated_conversation(
                 FIRST_SESSION_ID,
                 vec![String::from(ALPHA_ID), String::from(BRAVO_ID)],
-                String::from("Scout Bravo, report in. What's the status of the eastern path?"),
+                format!(
+                    "Scout Bravo, report in. What's the status of the eastern path?\n\n\
+This is a tool-call extraction probe: if either participant wants to warn, hold, mark, or secure, keep the spoken line in text and represent the action with tool_calls in the same utterance when possible.\n\n\
+{PATROL_ACTION_TOOL_SCHEMA}"
+                ),
                 vec![
                     String::from("The eastern path is exposed to enemy sight lines."),
                     String::from("The bridge approach must be secured before the squad advances."),
+                    String::from("Scout Bravo should warn about the exposed eastern path."),
+                    String::from("Commander Alpha should choose whether to hold position or secure the bridge approach."),
                 ],
             ));
             debug!("[demo] requested generated conversation {FIRST_SESSION_ID}");
@@ -305,6 +333,64 @@ fn collect_fact_strings(ledger: &ParticipantFactLedger) -> Vec<String> {
         }
     }
     facts
+}
+
+fn observe_generated_tool_calls(
+    mut events: EventReader<LlmConversationGenerationEvent>,
+    mut probe: ResMut<ToolCallProbe>,
+) {
+    for event in events.read() {
+        match event {
+            LlmConversationGenerationEvent::ConversationGenerated { conversation } => {
+                let mut session_calls = Vec::new();
+                for utterance in &conversation.utterances {
+                    for call in &utterance.tool_calls {
+                        info!(
+                            "[demo] generated tool call -> session={} speaker={} tool={} arguments={}",
+                            conversation.session_id, utterance.speaker, call.tool, call.arguments
+                        );
+                        session_calls.push(SpeakerToolCall {
+                            speaker: utterance.speaker.clone(),
+                            call: call.clone(),
+                        });
+                    }
+                }
+
+                info!(
+                    "[demo] tool-call probe session={} calls={}",
+                    conversation.session_id,
+                    session_calls.len()
+                );
+                probe
+                    .calls_by_session
+                    .insert(conversation.session_id.clone(), session_calls);
+            }
+            LlmConversationGenerationEvent::ConversationGenerationFailed { session_id, .. } => {
+                probe
+                    .calls_by_session
+                    .insert(session_id.clone(), Vec::new());
+            }
+        }
+    }
+}
+
+fn print_tool_call_probe(probe: &ToolCallProbe) {
+    let total_calls = probe.calls_by_session.values().map(Vec::len).sum::<usize>();
+    info!("[demo] tool-call probe total calls={total_calls}");
+
+    for (session_id, calls) in &probe.calls_by_session {
+        info!(
+            "[demo] tool-call probe summary -> session={} calls={}",
+            session_id,
+            calls.len()
+        );
+        for call in calls {
+            info!(
+                "  - speaker={} tool={} arguments={}",
+                call.speaker, call.call.tool, call.call.arguments
+            );
+        }
+    }
 }
 
 fn update_known_agent(
@@ -358,16 +444,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     id: String::from("qwen"),
                     model: LlmModel::Qwen2_5_1_5BInstructQ4KM,
                     use_gpu: true,
+                    tool_calling: LlmToolCallingMode::Auto,
                     worker_count: 1,
                     temperature: None,
                     top_p: None,
-                    max_new_tokens: 256,
+                    max_new_tokens: 1024,
                     ..Default::default()
                 },
                 LlmRuntimeProfileConfig {
                     id: String::from("smollm2"),
                     model: LlmModel::SmolLM2_360MInstruct,
                     use_gpu: true,
+                    tool_calling: LlmToolCallingMode::Auto,
                     worker_count: 1,
                     temperature: None,
                     top_p: None,
@@ -385,11 +473,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     install_llm_world_sync::<ConversationWorldView>(&mut app);
     app.insert_resource(DemoStatus::default());
     app.insert_resource(ProximityState::default());
+    app.insert_resource(ToolCallProbe::default());
     app.add_systems(
         Startup,
         (spawn_agents, initialize_conversation_threads).chain(),
     );
-    app.add_systems(Update, sync_proximity_world_and_chat);
+    app.add_systems(
+        Update,
+        (sync_proximity_world_and_chat, observe_generated_tool_calls),
+    );
 
     {
         let mut worlds = app
@@ -454,6 +546,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ledger = app.world().resource::<ParticipantFactLedger>();
     print_fact_ledger(ledger);
+    let probe = app.world().resource::<ToolCallProbe>();
+    print_tool_call_probe(probe);
 
     Ok(())
 }
