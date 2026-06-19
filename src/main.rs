@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    bevellm::run_example_app();
 }

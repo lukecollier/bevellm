@@ -1,0 +1,82 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   0.402582416s  INFO prepare_target{force=false package_id=bevellm_macros v0.1.0 (/Users/lukecollier/Projects/bevellm/crates/bevellm_macros) target="bevellm_macros"}: cargo::core::compiler::fingerprint: fingerprint error for bevellm_macros v0.1.0 (/Users/lukecollier/Projects/bevellm/crates/bevellm_macros)/Check { test: false }/TargetInner { name_inferred: true, for_host: true, proc_macro: true, ..: lib_target("bevellm_macros", ["proc-macro"], "/Users/lukecollier/Projects/bevellm/crates/bevellm_macros/src/lib.rs", Edition2024) }
+   0.402600708s  INFO prepare_target{force=false package_id=bevellm_macros v0.1.0 (/Users/lukecollier/Projects/bevellm/crates/bevellm_macros) target="bevellm_macros"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/lukecollier/Projects/bevellm/crates/bevellm_macros/target/debug/.fingerprint/bevellm_macros-94cdf9a4810bc44c/lib-bevellm_macros`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+   0.405853250s  INFO prepare_target{force=false package_id=syn v2.0.117 target="syn"}: cargo::core::compiler::fingerprint: fingerprint error for syn v2.0.117/Check { test: false }/TargetInner { ..: lib_target("syn", ["lib"], "/Users/lukecollier/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/syn-2.0.117/src/lib.rs", Edition2021) }
+   0.405863750s  INFO prepare_target{force=false package_id=syn v2.0.117 target="syn"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/lukecollier/Projects/bevellm/crates/bevellm_macros/target/debug/.fingerprint/syn-d617a3c1d9cad652/lib-syn`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: cargo::core::compiler::compile
+   8: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   9: cargo::ops::cargo_compile::compile_ws
+  10: cargo::ops::cargo_compile::compile_with_exec
+  11: cargo::ops::cargo_compile::compile
+  12: cargo::commands::check::exec
+  13: <cargo::cli::Exec>::exec
+  14: cargo::main
+  15: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  16: std::rt::lang_start::<()>::{closure#0}
+  17: std::rt::lang_start_internal
+  18: _main
+   0.406105583s  INFO prepare_target{force=false package_id=bevellm_macros v0.1.0 (/Users/lukecollier/Projects/bevellm/crates/bevellm_macros) target="bevellm_macros"}: cargo::core::compiler::fingerprint: fingerprint error for bevellm_macros v0.1.0 (/Users/lukecollier/Projects/bevellm/crates/bevellm_macros)/Check { test: true }/TargetInner { name_inferred: true, for_host: true, proc_macro: true, ..: lib_target("bevellm_macros", ["proc-macro"], "/Users/lukecollier/Projects/bevellm/crates/bevellm_macros/src/lib.rs", Edition2024) }
+   0.406112583s  INFO prepare_target{force=false package_id=bevellm_macros v0.1.0 (/Users/lukecollier/Projects/bevellm/crates/bevellm_macros) target="bevellm_macros"}: cargo::core::compiler::fingerprint:     err: failed to read `/Users/lukecollier/Projects/bevellm/crates/bevellm_macros/target/debug/.fingerprint/bevellm_macros-bf6c734a754f8812/test-lib-bevellm_macros`
+
+Caused by:
+    No such file or directory (os error 2)
+
+Stack backtrace:
+   0: std::backtrace::Backtrace::create
+   1: std::backtrace::Backtrace::capture
+   2: cargo_util::paths::read_bytes
+   3: cargo_util::paths::read
+   4: cargo::core::compiler::fingerprint::_compare_old_fingerprint
+   5: cargo::core::compiler::fingerprint::prepare_target
+   6: cargo::core::compiler::compile
+   7: <cargo::core::compiler::build_runner::BuildRunner>::compile
+   8: cargo::ops::cargo_compile::compile_ws
+   9: cargo::ops::cargo_compile::compile_with_exec
+  10: cargo::ops::cargo_compile::compile
+  11: cargo::commands::check::exec
+  12: <cargo::cli::Exec>::exec
+  13: cargo::main
+  14: std::sys::backtrace::__rust_begin_short_backtrace::<fn(), ()>
+  15: std::rt::lang_start::<()>::{closure#0}
+  16: std::rt::lang_start_internal
+  17: _main
+    Checking syn v2.0.117
+    Checking bevellm_macros v0.1.0 (/Users/lukecollier/Projects/bevellm/crates/bevellm_macros)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.94s
